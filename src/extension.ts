@@ -2,8 +2,19 @@
 
 import * as vscode from "vscode";
 import { homedir } from "os";
-import { readdir, writeFileSync, mkdirSync } from "fs";
+import { readdir, writeFileSync, mkdirSync, existsSync } from "fs";
 import { sep, extname } from "path";
+import * as vm from "vm";
+import * as _ from "lodash";
+import * as qim from "qim";
+
+const SCRATCH_FILENAME = ".scratch.js";
+
+const SCRATCH_TEMPLATE = `
+// JavaScript REPL
+// Lodash is already imported
+
+`.trim();
 
 const SCRIPT_TEMPLATE = `
 module.exports = function (selection) {
@@ -16,7 +27,8 @@ module.exports = function (selection) {
 
 const getScriptDir = () => homedir() + `${sep}.scriptbox${sep}`;
 
-const isScript = filename => filename.endsWith(".js");
+const isScript = filename =>
+  filename.endsWith(".js") && !filename.endsWith(SCRATCH_FILENAME);
 
 const enumerateScripts = dir =>
   new Promise<string[]>((resolve, reject) =>
@@ -111,12 +123,14 @@ const initializeConsole = () => {
   console.log(
     "All console.* statements from ScriptBox scripts will appear here"
   );
+
+  return outputChannel;
 };
 
 type QuickPickScriptItem = {
   script: string;
   label: string;
-  desciption: string;
+  description: string;
 };
 
 const createQuickPickItemsForScripts = (scripts): QuickPickScriptItem[] =>
@@ -149,8 +163,27 @@ const ensureScriptDir = scriptDir => {
   }
 };
 
+const evaluate = _.debounce(
+  (outputChannel: vscode.OutputChannel, code: string) => {
+    try {
+      const ctx = vm.createContext({
+        // This is where default imports for the scratch REPL go ...
+        _,
+        ...qim
+      });
+      const result = vm.runInContext(code, ctx);
+      outputChannel.clear();
+      outputChannel.show(true);
+      console.log(JSON.stringify(result, null, "  "));
+    } catch (err) {
+      console.error(err);
+    }
+  },
+  300
+);
+
 export function activate(context: vscode.ExtensionContext) {
-  initializeConsole();
+  const outputChannel = initializeConsole();
 
   ensureScriptDir(getScriptDir());
 
@@ -226,6 +259,33 @@ export function activate(context: vscode.ExtensionContext) {
         console.error(err);
       }
     })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("extension.openScratch", async () => {
+      const filename = `${getScriptDir()}${SCRATCH_FILENAME}`;
+
+      if (!existsSync(filename)) {
+        writeFileSync(filename, SCRATCH_TEMPLATE, "UTF-8");
+      }
+
+      openScriptForEditing(filename);
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeTextDocument(
+      (e: vscode.TextDocumentChangeEvent) => {
+        const scratchFilename = `${getScriptDir()}${SCRATCH_FILENAME}`;
+        const didScratchChange =
+          e.document.fileName.toLowerCase() === scratchFilename.toLowerCase();
+
+        if (didScratchChange) {
+          const code = e.document.getText();
+          evaluate(outputChannel, code);
+        }
+      }
+    )
   );
 }
 
